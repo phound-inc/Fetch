@@ -25,6 +25,7 @@ import android.net.ConnectivityManager;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.Looper;
 import android.support.annotation.NonNull;
 import android.support.annotation.Nullable;
@@ -66,7 +67,16 @@ public final class Fetch implements FetchConst {
     private final DatabaseHelper dbHelper;
     private volatile boolean isReleased = false;
 
-    private Fetch(Context context) {
+    private final Handler mBackgroundHandler;
+    private final HandlerThread mBackgroundHandlerThread;
+
+    private final boolean mPostUpdatesOnUIThread;
+
+    private Fetch(Context context, boolean postUpdatesOnUIThread) {
+
+        this.mBackgroundHandlerThread = new HandlerThread("FetchBackgroundThread");
+        this.mBackgroundHandlerThread.start();
+        this.mBackgroundHandler = new Handler(mBackgroundHandlerThread.getLooper());
 
         this.context = context.getApplicationContext();
 
@@ -74,11 +84,16 @@ public final class Fetch implements FetchConst {
         this.dbHelper = DatabaseHelper.getInstance(this.context);
         this.dbHelper.setLoggingEnabled(isLoggingEnabled());
 
+        this.mPostUpdatesOnUIThread = postUpdatesOnUIThread;
+
         broadcastManager.registerReceiver(updateReceiver,
                 FetchService.getEventUpdateFilter());
 
         this.context.registerReceiver(networkReceiver,
-                new IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION));
+                new IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION),
+                null,
+                this.mBackgroundHandler
+        );
 
         startService(this.context);
     }
@@ -115,12 +130,16 @@ public final class Fetch implements FetchConst {
      * @throws NullPointerException if context is null
      */
     public static Fetch newInstance(@NonNull Context context) {
+        return Fetch.newInstance(context, true);
+    }
+
+    public static Fetch newInstance(@NonNull Context context, boolean postUpdatesOnUiThread) {
 
         if (context == null) {
             throw new NullPointerException("Context cannot be null");
         }
 
-        return new Fetch(context);
+        return new Fetch(context, postUpdatesOnUiThread);
     }
 
     /**
@@ -960,6 +979,23 @@ public final class Fetch implements FetchConst {
         private long fileSize;
         private int error;
 
+        private final Runnable updateRunnable = new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    final Iterator<FetchListener> listenerIterator = getListenerIterator();
+                    while (listenerIterator.hasNext()) {
+                        final FetchListener listener = listenerIterator.next();
+                        listener.onUpdate(id, status, progress, downloadedBytes, fileSize, error);
+                    }
+                } catch (Exception e) {
+                    if (isLoggingEnabled()) {
+                        e.printStackTrace();
+                    }
+                }
+            }
+        };
+
         @Override
         public void onReceive(Context context, Intent intent) {
 
@@ -974,16 +1010,10 @@ public final class Fetch implements FetchConst {
             fileSize = intent.getLongExtra(FetchService.EXTRA_FILE_SIZE, DEFAULT_EMPTY_VALUE);
             error = intent.getIntExtra(FetchService.EXTRA_ERROR, DEFAULT_EMPTY_VALUE);
 
-            try {
-                final Iterator<FetchListener> listenerIterator = getListenerIterator();
-                while (listenerIterator.hasNext()) {
-                    final FetchListener listener = listenerIterator.next();
-                    listener.onUpdate(id, status, progress, downloadedBytes, fileSize, error);
-                }
-            } catch (Exception e) {
-                if (isLoggingEnabled()) {
-                    e.printStackTrace();
-                }
+            if (Fetch.this.mPostUpdatesOnUIThread) {
+                mainHandler.post(updateRunnable);
+            } else {
+                mBackgroundHandler.post(updateRunnable);
             }
         }
     };
